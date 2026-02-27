@@ -56,6 +56,11 @@ DEFAULT_TEST_TIMEOUT = 600      # 10 minutes - max time per single test
 DEFAULT_SUITE_TIMEOUT = 7200    # 2 hours - max time per suite/feature run
 HEALTH_CHECK_INTERVAL = 10      # Check every 10 seconds
 
+# Early Abort (Fail-Fast) defaults
+DEFAULT_MAX_CONSECUTIVE_FAILS = 40  # 40 consecutive fails → abort
+DEFAULT_FAIL_RATE_ABORT = 80        # >80% fail after min tests → abort
+DEFAULT_MIN_TESTS_FOR_RATE = 70     # Min tests before checking fail rate
+
 
 # =============================================================================
 # PROCESS MANAGEMENT
@@ -95,12 +100,15 @@ def kill_process_tree(pid: int):
 
 class OutputMonitor:
     """
-    Monitor subprocess output for hang detection.
+    Monitor subprocess output for hang detection + early abort.
     Tracks the last time new output was received.
     Optionally emits realtime events to TestTracker.
     """
 
-    def __init__(self, tracker: 'TestTracker' = None):
+    def __init__(self, tracker: 'TestTracker' = None,
+                 max_consecutive_fails: int = DEFAULT_MAX_CONSECUTIVE_FAILS,
+                 fail_rate_abort: int = DEFAULT_FAIL_RATE_ABORT,
+                 min_tests_for_rate: int = DEFAULT_MIN_TESTS_FOR_RATE):
         self.last_output_time = time.time()
         self.output_lines: List[str] = []
         self.current_test: Optional[str] = None
@@ -108,6 +116,16 @@ class OutputMonitor:
         self._stop = False
         self._tracker = tracker
         self._test_start_time: Optional[float] = None
+
+        # Early abort tracking
+        self._max_consecutive_fails = max_consecutive_fails
+        self._fail_rate_abort = fail_rate_abort
+        self._min_tests_for_rate = min_tests_for_rate
+        self._consecutive_fails = 0
+        self._total_pass = 0
+        self._total_fail = 0
+        self._abort_triggered = False
+        self._abort_reason = ""
 
     def update(self, line: str):
         with self.lock:
@@ -134,6 +152,15 @@ class OutputMonitor:
                     if self._test_start_time:
                         duration = time.time() - self._test_start_time
                         self._test_start_time = None
+
+                    # ─── Early Abort: track pass/fail stats ───
+                    if status == 'FAIL':
+                        self._consecutive_fails += 1
+                        self._total_fail += 1
+                    else:
+                        self._consecutive_fails = 0
+                        self._total_pass += 1
+                    self._check_abort_conditions(test_name)
 
                     # Emit to realtime tracker
                     if self._tracker:
@@ -165,6 +192,42 @@ class OutputMonitor:
                         except Exception:
                             pass
 
+    def _check_abort_conditions(self, last_test: str):
+        """Check if early abort should be triggered."""
+        total = self._total_pass + self._total_fail
+
+        # Rule 1: consecutive fails threshold
+        if (self._max_consecutive_fails > 0 and
+                self._consecutive_fails >= self._max_consecutive_fails):
+            self._abort_triggered = True
+            self._abort_reason = (
+                f"EARLY ABORT: {self._consecutive_fails} consecutive FAILs "
+                f"(threshold: {self._max_consecutive_fails}). "
+                f"Likely environment issue — stopping to save time."
+            )
+            return
+
+        # Rule 2: fail rate threshold (only after min tests)
+        if (self._fail_rate_abort > 0 and
+                total >= self._min_tests_for_rate):
+            fail_rate = (self._total_fail / total) * 100
+            if fail_rate >= self._fail_rate_abort:
+                self._abort_triggered = True
+                self._abort_reason = (
+                    f"EARLY ABORT: Fail rate {fail_rate:.0f}% "
+                    f"({self._total_fail}/{total} tests) exceeds "
+                    f"{self._fail_rate_abort}% threshold. "
+                    f"Stopping to save time."
+                )
+
+    def should_abort(self) -> bool:
+        with self.lock:
+            return self._abort_triggered
+
+    def get_abort_reason(self) -> str:
+        with self.lock:
+            return self._abort_reason
+
     def get_idle_seconds(self) -> float:
         with self.lock:
             return time.time() - self.last_output_time
@@ -172,6 +235,17 @@ class OutputMonitor:
     def get_current_test(self) -> Optional[str]:
         with self.lock:
             return self.current_test
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            total = self._total_pass + self._total_fail
+            return {
+                'total': total,
+                'passed': self._total_pass,
+                'failed': self._total_fail,
+                'consecutive_fails': self._consecutive_fails,
+                'fail_rate': round((self._total_fail / max(total, 1)) * 100, 1),
+            }
 
     def stop(self):
         self._stop = True
@@ -205,6 +279,8 @@ def run_robot_with_hang_detection(
     suite_timeout: int = DEFAULT_SUITE_TIMEOUT,
     run_label: str = "main",
     tracker: 'TestTracker' = None,
+    max_consecutive_fails: int = DEFAULT_MAX_CONSECUTIVE_FAILS,
+    fail_rate_abort: int = DEFAULT_FAIL_RATE_ABORT,
 ) -> dict:
     """
     Run Robot Framework with hang detection.
@@ -241,7 +317,11 @@ def run_robot_with_hang_detection(
     print(f"{'='*70}\n")
 
     start_time = time.time()
-    monitor = OutputMonitor(tracker=tracker)
+    monitor = OutputMonitor(
+        tracker=tracker,
+        max_consecutive_fails=max_consecutive_fails,
+        fail_rate_abort=fail_rate_abort,
+    )
     result = {
         'return_code': 0,
         'hang_detected': False,
@@ -249,6 +329,8 @@ def run_robot_with_hang_detection(
         'output_xml': os.path.join(outputdir, 'output.xml'),
         'duration_sec': 0,
         'killed': False,
+        'early_abort': False,
+        'abort_reason': '',
     }
 
     # Log file for debugging
@@ -320,6 +402,23 @@ def run_robot_with_hang_detection(
                 result['killed'] = True
                 break
 
+            # Check early abort (mass failures)
+            if monitor.should_abort():
+                reason = monitor.get_abort_reason()
+                stats = monitor.get_stats()
+                print(f"\n🛑 {reason}")
+                print(f"   Stats: {stats['passed']} pass / {stats['failed']} fail "
+                      f"({stats['fail_rate']}%)")
+                log_file.write(f"\n[WRAPPER] {reason}\n")
+                log_file.write(f"[WRAPPER] Stats: {stats}\n")
+
+                kill_process_tree(process.pid)
+                result['return_code'] = -3
+                result['early_abort'] = True
+                result['abort_reason'] = reason
+                result['killed'] = True
+                break
+
         # Process finished normally
         if not result['killed']:
             reader_thread.join(timeout=30)
@@ -338,7 +437,10 @@ def run_robot_with_hang_detection(
 
     # Summary
     print(f"\n{'='*70}")
-    if result['hang_detected']:
+    if result.get('early_abort'):
+        print(f"🛑 Execution ABORTED due to mass failures")
+        print(f"   Reason: {result['abort_reason']}")
+    elif result['hang_detected']:
         print(f"🔴 Execution KILLED due to hang/timeout")
         print(f"   Hung test: {result['hung_test']}")
     else:
@@ -358,6 +460,8 @@ def run_with_hang_recovery(
     test_timeout: int,
     suite_timeout: int,
     tracker: 'TestTracker' = None,
+    max_consecutive_fails: int = DEFAULT_MAX_CONSECUTIVE_FAILS,
+    fail_rate_abort: int = DEFAULT_FAIL_RATE_ABORT,
 ) -> dict:
     """
     Run test suites with automatic hang recovery.
@@ -402,12 +506,19 @@ def run_with_hang_recovery(
             suite_timeout=suite_timeout,
             run_label=f"attempt_{attempt}",
             tracker=tracker,
+            max_consecutive_fails=max_consecutive_fails,
+            fail_rate_abort=fail_rate_abort,
         )
 
         # Collect output.xml if it exists
         output_xml = os.path.join(run_outputdir, 'output.xml')
         if os.path.exists(output_xml):
             all_outputs.append(output_xml)
+
+        if result.get('early_abort'):
+            # Mass failure detected - stop completely
+            print(f"🛑 Early abort triggered: {result.get('abort_reason', '')}")
+            break
 
         if not result['hang_detected']:
             # No hang - we're done
@@ -503,6 +614,13 @@ Examples:
         help=f'Max seconds for entire suite run (default: {DEFAULT_SUITE_TIMEOUT})')
     parser.add_argument('--no-recovery', action='store_true',
         help='Disable automatic hang recovery (just kill and stop)')
+    # ─── Early Abort (Fail-Fast) ───
+    parser.add_argument('--max-consecutive-fails', type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_FAILS,
+        help=f'Abort if N tests fail consecutively (default: {DEFAULT_MAX_CONSECUTIVE_FAILS}). Set 0 to disable.')
+    parser.add_argument('--fail-rate-abort', type=int,
+        default=DEFAULT_FAIL_RATE_ABORT,
+        help=f'Abort if fail rate exceeds N%% after {DEFAULT_MIN_TESTS_FOR_RATE} tests (default: {DEFAULT_FAIL_RATE_ABORT}%%). Set 0 to disable.')
     # ─── Realtime Tracker ───
     parser.add_argument('--tracker-file', default=None,
         help='Path to realtime tracker JSON file (updated after each test)')
@@ -555,6 +673,8 @@ Examples:
             test_timeout=args.test_timeout,
             suite_timeout=args.suite_timeout,
             tracker=tracker,
+            max_consecutive_fails=args.max_consecutive_fails,
+            fail_rate_abort=args.fail_rate_abort,
         )
         sys.exit(0 if result['return_code'] >= 0 else 1)
     else:
@@ -566,6 +686,8 @@ Examples:
             test_timeout=args.test_timeout,
             suite_timeout=args.suite_timeout,
             tracker=tracker,
+            max_consecutive_fails=args.max_consecutive_fails,
+            fail_rate_abort=args.fail_rate_abort,
         )
 
         if result['hung_tests']:
